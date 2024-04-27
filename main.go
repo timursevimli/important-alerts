@@ -87,11 +87,6 @@ func getBot() *bot.Bot {
 	b, err := bot.New(token)
 	check(err)
 	return b
-
-	// b.SendMessage(ctx, &bot.SendMessageParams{
-	// 	ChatID: -1002127502421,
-	// 	Text:   "Hello!",
-	// })
 }
 
 func sendMessage(b *bot.Bot, chatID int64, text string) {
