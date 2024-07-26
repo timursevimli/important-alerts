@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-telegram/bot"
@@ -144,30 +145,29 @@ func getCollector() *colly.Collector {
 	return c
 }
 
-func getLastAlert(url string) Alert {
+func getLastAlert(url string) (alert Alert) {
 	c := getCollector()
-	alertCh := make(chan Alert)
 
-	go func() {
-		defer close(alertCh)
-		c.Visit(url)
-	}()
+	var wg sync.WaitGroup
 
-	visited := false
 	c.OnHTML("#content article", func(e *colly.HTMLElement) {
-		if visited {
+		wg.Add(1)
+		defer wg.Done()
+		if alert != (Alert{}) {
 			return
 		}
 		title := e.ChildText("h2.entry-title a")
 		url := e.ChildAttr("h2.entry-title a", "href")
-		alertCh <- Alert{
+		alert = Alert{
 			Title: title,
 			URL:   url,
 		}
-		visited = true
 	})
 
-	return <-alertCh
+	c.Visit(url)
+	wg.Wait()
+
+	return alert
 }
 
 func getHtmlContent(url string) string {
