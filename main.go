@@ -14,9 +14,11 @@ import (
 	"github.com/joho/godotenv"
 )
 
-const DIR = "titles"
-const MAX_MESSAGE_LENGTH = 4096
-const REPEAT_DELAY_IN_HOURS = 1
+const (
+	DIR                   = "titles"
+	MAX_MESSAGE_LENGTH    = 4096
+	REPEAT_DELAY_IN_HOURS = 1
+)
 
 var chatIDs = map[string]int64{
 	"ua": -1002127502421,
