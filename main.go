@@ -28,8 +28,7 @@ var chatIDs = map[string]int64{
 }
 
 func main() {
-	err := godotenv.Load()
-	check(err)
+	loadEnv()
 	b := getBot()
 	for {
 		log.Println("Checking...")
@@ -64,6 +63,11 @@ func main() {
 		log.Println("Checking completed and sleeping...")
 		time.Sleep(time.Hour * REPEAT_DELAY_IN_HOURS)
 	}
+}
+
+func loadEnv() {
+	err := godotenv.Load()
+	check(err)
 }
 
 func split(content string, size int) []string {
