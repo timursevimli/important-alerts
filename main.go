@@ -30,36 +30,46 @@ var chatIDs = map[string]int64{
 func main() {
 	loadEnv()
 	b := getBot()
+
+	var wg sync.WaitGroup
+
 	for {
 		log.Println("Checking...")
 		countries := getFilesInDirectory(DIR)
 		for _, country := range countries {
-			baseURL := "https://" + country + ".usembassy.gov"
-			url := baseURL + "/category/alert/"
-			log.Print("Checking: " + baseURL)
-			alert := getLastAlert(url)
-			fileName := DIR + "/" + country
-			lastTitle := readFile(fileName)
-			if alert.Title == lastTitle {
-				log.Print("No new alerts: " + baseURL)
-				continue
-			}
-			log.Print("New alert found : " + baseURL)
-			content := getHtmlContent(alert.URL)
-			chatID := chatIDs[country]
-			if chatID == 0 {
-				continue
-			}
-			if len(content) > MAX_MESSAGE_LENGTH {
-				contentParts := split(content, MAX_MESSAGE_LENGTH)
-				for _, contentPart := range contentParts {
-					sendMessage(b, chatID, contentPart)
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				baseURL := "https://" + country + ".usembassy.gov"
+				url := baseURL + "/category/alert/"
+				log.Print("Checking: " + baseURL)
+				fileName := DIR + "/" + country
+				lastTitle := readFile(fileName)
+				alert := getLastAlert(url)
+				if lastTitle == "" {
+					saveFile(fileName, alert.Title)
+					log.Print("Initial alert created: " + baseURL)
+					return
 				}
-			} else {
-				sendMessage(b, chatID, content)
-			}
-			saveFile(fileName, alert.Title)
+				if alert.Title == lastTitle {
+					log.Print("No new alerts: " + baseURL)
+					return
+				}
+				saveFile(fileName, alert.Title)
+				log.Print("New alert found : " + baseURL)
+				content := getHtmlContent(alert.URL)
+				chatID := chatIDs[country]
+				if len(content) > MAX_MESSAGE_LENGTH {
+					contentParts := split(content, MAX_MESSAGE_LENGTH)
+					for _, contentPart := range contentParts {
+						sendMessage(b, chatID, contentPart)
+					}
+				} else {
+					sendMessage(b, chatID, content)
+				}
+			}()
 		}
+		wg.Wait()
 		log.Println("Checking completed and sleeping...")
 		time.Sleep(time.Hour * REPEAT_DELAY_IN_HOURS)
 	}
