@@ -84,8 +84,10 @@ func main() {
 }
 
 func loadEnv() {
-	err := godotenv.Load()
-	check(err)
+	if os.Getenv("APP_ENV") == "development" {
+		err := godotenv.Load()
+		check(err)
+	}
 }
 
 func split(content string, size int) []string {
