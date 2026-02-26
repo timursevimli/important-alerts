@@ -46,6 +46,7 @@ func main() {
 				fileName := DIR + "/" + country
 				lastTitle := readFile(fileName)
 				alert := getLastAlert(url)
+				log.Print("Last alert: " + lastTitle)
 				if lastTitle == "" {
 					saveFile(fileName, alert.Title)
 					log.Print("Initial alert created: " + baseURL)
@@ -56,9 +57,16 @@ func main() {
 					return
 				}
 				saveFile(fileName, alert.Title)
-				log.Print("New alert found : " + baseURL)
+				log.Print("New alert found : " + alert.Title + " (" + alert.URL + ")")
 				content := getHtmlContent(alert.URL)
 				chatID := chatIDs[country]
+				if content == "" {
+					log.Print("No content: " + alert.URL)
+					return
+				}
+				if !strings.Contains(content, alert.Title) {
+					content = alert.Title + "\n\n" + content
+				}
 				if len(content) > MAX_MESSAGE_LENGTH {
 					contentParts := split(content, MAX_MESSAGE_LENGTH)
 					for _, contentPart := range contentParts {
@@ -166,12 +174,12 @@ func getLastAlert(url string) (alert Alert) {
 
 	var wg sync.WaitGroup
 
-	c.OnHTML("#content article", func(e *colly.HTMLElement) {
-		wg.Add(1)
-		defer wg.Done()
+	c.OnHTML("main > article", func(e *colly.HTMLElement) {
 		if alert != (Alert{}) {
 			return
 		}
+		wg.Add(1)
+		defer wg.Done()
 		title := e.ChildText("h2.entry-title a")
 		url := e.ChildAttr("h2.entry-title a", "href")
 		alert = Alert{
@@ -188,13 +196,22 @@ func getLastAlert(url string) (alert Alert) {
 
 func getHtmlContent(url string) string {
 	c := getCollector()
+	var sb strings.Builder
 
-	var content string
+	c.OnHTML(`.paragraph.alignwide.container .row`, func(e *colly.HTMLElement) {
+		e.ForEach(`p, ul li`, func(_ int, el *colly.HTMLElement) {
+			text := strings.TrimSpace(el.Text)
+			if text == "" {
+				return
+			}
 
-	c.OnHTML(".entry-content", func(e *colly.HTMLElement) {
-		content = e.Text
+			sb.WriteString(text)
+			if el.Name != "li" {
+				sb.WriteString("\n\n")
+			}
+		})
 	})
 
 	c.Visit(url)
-	return content
+	return sb.String()
 }
