@@ -6,6 +6,7 @@ COPY *.go ./
 RUN CGO_ENABLED=0 GOOS=linux go build -o /important-notifications
 
 FROM alpine:latest
+WORKDIR /app
 COPY . .
 COPY --from=builder /important-notifications /important-notifications
 CMD ["/important-notifications"]

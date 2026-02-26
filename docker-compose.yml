@@ -6,4 +6,4 @@ services:
       - BOT_TOKEN=${BOT_TOKEN}
       - APP_ENV=${APP_ENV}
     volumes:
-      - ./titles:/titles
+      - ./titles:/app/titles

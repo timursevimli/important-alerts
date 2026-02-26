@@ -127,6 +127,9 @@ func saveFile(fileName string, content string) {
 
 func readFile(fileName string) string {
 	file, err := os.ReadFile(fileName)
+	if os.IsNotExist(err) {
+		return ""
+	}
 	check(err)
 	return strings.TrimSpace(string(file))
 }
