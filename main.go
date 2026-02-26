@@ -35,8 +35,7 @@ func main() {
 
 	for {
 		log.Println("Checking...")
-		countries := getFilesInDirectory(DIR)
-		for _, country := range countries {
+		for country, chatID := range chatIDs {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
@@ -59,7 +58,6 @@ func main() {
 				saveFile(fileName, alert.Title)
 				log.Print("New alert found : " + alert.Title + " (" + alert.URL + ")")
 				content := getHtmlContent(alert.URL)
-				chatID := chatIDs[country]
 				if content == "" {
 					log.Print("No content: " + alert.URL)
 					return
@@ -121,17 +119,6 @@ func sendMessage(b *bot.Bot, chatID int64, text string) {
 		ChatID: chatID,
 		Text:   strings.Trim(text, "\n\r"),
 	})
-}
-
-func getFilesInDirectory(dirname string) []string {
-	fileNames := []string{}
-	files, err := filepath.Glob(filepath.Join(dirname, "*"))
-	check(err)
-	for _, filePath := range files {
-		fileName := strings.ReplaceAll(filePath, dirname+"/", "")
-		fileNames = append(fileNames, fileName)
-	}
-	return fileNames
 }
 
 func saveFile(fileName string, content string) {
