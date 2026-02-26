@@ -5,5 +5,9 @@ services:
     environment:
       - BOT_TOKEN=${BOT_TOKEN}
       - APP_ENV=${APP_ENV}
+      - CHANNEL_ID_UA=${CHANNEL_ID_UA}
+      - CHANNEL_ID_TR=${CHANNEL_ID_TR}
+      - CHANNEL_ID_IL=${CHANNEL_ID_IL}
+      - CHANNEL_ID_RU=${CHANNEL_ID_RU}
     volumes:
       - ./titles:/app/titles

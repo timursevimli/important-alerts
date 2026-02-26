@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -19,15 +20,11 @@ const (
 	REPEAT_DELAY_IN_HOURS = 1
 )
 
-var chatIDs = map[string]int64{
-	"ua": -1002127502421,
-	"tr": -1002050212638,
-	"il": -1002073228695,
-	"ru": -1002116092146,
-}
+var chatIDs map[string]int64
 
 func main() {
 	loadEnv()
+	chatIDs = loadChatIDs()
 	b := getBot()
 
 	var wg sync.WaitGroup
@@ -85,6 +82,28 @@ func loadEnv() {
 		err := godotenv.Load()
 		check(err)
 	}
+}
+
+func loadChatIDs() map[string]int64 {
+	envKeys := map[string]string{
+		"ua": "CHANNEL_ID_UA",
+		"tr": "CHANNEL_ID_TR",
+		"il": "CHANNEL_ID_IL",
+		"ru": "CHANNEL_ID_RU",
+	}
+	result := make(map[string]int64, len(envKeys))
+	for country, key := range envKeys {
+		raw := os.Getenv(key)
+		if raw == "" {
+			log.Fatalf("missing environment variable: %s", key)
+		}
+		id, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			log.Fatalf("invalid %s: %v", key, err)
+		}
+		result[country] = id
+	}
+	return result
 }
 
 func split(content string, size int) []string {
