@@ -90,6 +90,7 @@ func loadChatIDs() map[string]int64 {
 		"tr": "CHANNEL_ID_TR",
 		"il": "CHANNEL_ID_IL",
 		"ru": "CHANNEL_ID_RU",
+		"ir": "CHANNEL_ID_IR",
 	}
 	result := make(map[string]int64, len(envKeys))
 	for country, key := range envKeys {

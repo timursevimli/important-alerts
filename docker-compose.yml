@@ -9,5 +9,6 @@ services:
       - CHANNEL_ID_TR=${CHANNEL_ID_TR}
       - CHANNEL_ID_IL=${CHANNEL_ID_IL}
       - CHANNEL_ID_RU=${CHANNEL_ID_RU}
+      - CHANNEL_ID_IR=${CHANNEL_ID_IR}
     volumes:
       - ./titles:/app/titles
