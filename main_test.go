@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode"
@@ -50,7 +51,7 @@ func TestSplitKeepsRunesIntact(t *testing.T) {
 	// would land inside a rune.
 	content := strings.Repeat("привет ", 3000)
 
-	for _, limit := range []int{1, 2, 3, 7, 100, 4096} {
+	for _, limit := range []int{2, 3, 7, 100, 4096} {
 		parts := split(content, limit)
 		for i, part := range parts {
 			if !utf8.ValidString(part) {
@@ -201,11 +202,16 @@ func (s *stub) setTitle(t *testing.T, country, title string) {
 
 func (s *stub) title(t *testing.T, country string) string {
 	t.Helper()
-	title, err := readFile(s.dir + "/" + country)
+	return s.state(t, country).Title
+}
+
+func (s *stub) state(t *testing.T, country string) deliveryState {
+	t.Helper()
+	state, err := readState(s.dir + "/" + country)
 	if err != nil {
-		t.Fatalf("readFile: %v", err)
+		t.Fatalf("readState: %v", err)
 	}
-	return title
+	return state
 }
 
 // The regression test for the original bug: the title used to be recorded
@@ -242,16 +248,171 @@ func TestCheckCountrySavesTitleAfterSuccessfulSend(t *testing.T) {
 	}
 }
 
-func TestSendAlertStopsAtTheFailingPart(t *testing.T) {
+func TestDeliverStopsAtTheFailingPart(t *testing.T) {
 	s := newStub(t)
 	s.failOn = 2
 
 	content := strings.Repeat("абв ", 4000) // long enough to need several parts
-	if err := sendAlert(s.send, 1, content); err == nil {
-		t.Fatal("expected sendAlert to report the failure")
+	err := deliver(s.send, 1, s.dir+"/ua", deliveryState{Title: "Old alert"}, Alert{Title: "New alert"}, content)
+	if err == nil {
+		t.Fatal("expected deliver to report the failure")
 	}
 	if len(s.sent) != 2 {
 		t.Fatalf("attempted %d parts, want it to stop at the failing one", len(s.sent))
+	}
+
+	// The one part that did arrive must be checkpointed, not repeated later.
+	state := s.state(t, "ua")
+	if state.Title != "Old alert" {
+		t.Errorf("last delivered title = %q, want it unchanged", state.Title)
+	}
+	if state.Pending != "New alert" || state.Sent != 1 {
+		t.Errorf("checkpoint = %+v, want pending %q with 1 part sent", state, "New alert")
+	}
+}
+
+// The whole point of the checkpoint: a subscriber must never see a part twice
+// because a later part failed.
+func TestDeliverResumesWithoutRepeatingParts(t *testing.T) {
+	s := newStub(t)
+	s.setTitle(t, "ua", "Old alert")
+	s.alert = Alert{Title: "New alert", URL: "https://ua.usembassy.gov/new"}
+	s.content = "New alert\n\n" + strings.Repeat("Тривога у Києві. ", 1200)
+
+	wantParts := split(s.content, MAX_MESSAGE_LENGTH)
+	if len(wantParts) < 3 {
+		t.Fatalf("this test needs a multi-part alert, got %d parts", len(wantParts))
+	}
+
+	// Pass 1 fails on the second part.
+	s.failOn = 2
+	if err := checkCountry(s.send, "ua", 1); err == nil {
+		t.Fatal("expected the first pass to fail")
+	}
+	firstPass := append([]string(nil), s.sent...)
+
+	// Pass 2 succeeds and must pick up where the first stopped.
+	s.failOn = 0
+	s.sent = nil
+	if err := checkCountry(s.send, "ua", 1); err != nil {
+		t.Fatalf("second pass: %v", err)
+	}
+
+	delivered := append(firstPass[:len(firstPass)-1], s.sent...) // the failed part never arrived
+	if len(delivered) != len(wantParts) {
+		t.Fatalf("delivered %d parts, want %d", len(delivered), len(wantParts))
+	}
+	for i := range wantParts {
+		if delivered[i] != wantParts[i] {
+			t.Fatalf("part %d differs from the expected split", i)
+		}
+	}
+
+	seen := map[string]int{}
+	for _, part := range delivered {
+		seen[part]++
+	}
+	for part, n := range seen {
+		if n != 1 {
+			t.Errorf("part %.40q was delivered %d times", part, n)
+		}
+	}
+
+	if got := s.state(t, "ua"); got.Title != "New alert" || got.Pending != "" || got.Sent != 0 {
+		t.Errorf("final state = %+v, want the alert committed and no pending delivery", got)
+	}
+}
+
+// A page that is rewritten between passes invalidates the offset, otherwise
+// resuming would skip the wrong piece of the new text.
+func TestDeliverRestartsWhenTheContentChanged(t *testing.T) {
+	s := newStub(t)
+	original := strings.Repeat("Тривога у Києві. ", 1200)
+	state := deliveryState{
+		Title:   "Old alert",
+		Pending: "New alert",
+		Digest:  contentDigest(original),
+		Sent:    2,
+	}
+
+	rewritten := strings.Repeat("Оновлена тривога. ", 1200)
+	if err := deliver(s.send, 1, s.dir+"/ua", state, Alert{Title: "New alert"}, rewritten); err != nil {
+		t.Fatalf("deliver: %v", err)
+	}
+
+	want := split(rewritten, MAX_MESSAGE_LENGTH)
+	if len(s.sent) != len(want) {
+		t.Fatalf("delivered %d parts, want all %d of the rewritten alert", len(s.sent), len(want))
+	}
+}
+
+func TestDeliverResumesAfterAFailedCheckpointWrite(t *testing.T) {
+	s := newStub(t)
+	content := "New alert\n\nbody"
+	fileName := s.dir + "/ua"
+
+	// The commit write failed last pass, so the checkpoint says everything was
+	// already sent. Nothing may be delivered again.
+	state := deliveryState{
+		Title:   "Old alert",
+		Pending: "New alert",
+		Digest:  contentDigest(content),
+		Sent:    len(split(content, MAX_MESSAGE_LENGTH)),
+	}
+	if err := deliver(s.send, 1, fileName, state, Alert{Title: "New alert"}, content); err != nil {
+		t.Fatalf("deliver: %v", err)
+	}
+	if len(s.sent) != 0 {
+		t.Errorf("re-delivered %d parts, want none", len(s.sent))
+	}
+	if got := s.state(t, "ua"); got.Title != "New alert" || got.Pending != "" {
+		t.Errorf("state = %+v, want the alert committed", got)
+	}
+}
+
+// Files written before delivery tracking existed hold a bare title, and an
+// upgrade must not treat the current alert as new.
+func TestReadStateAcceptsTheLegacyBareTitle(t *testing.T) {
+	dir := t.TempDir()
+	if err := saveFile(dir+"/ua", "Security Alert – U.S. Embassy Moscow, Russia (June 18, 2026)"); err != nil {
+		t.Fatal(err)
+	}
+
+	state, err := readState(dir + "/ua")
+	if err != nil {
+		t.Fatalf("readState: %v", err)
+	}
+	if state.Title != "Security Alert – U.S. Embassy Moscow, Russia (June 18, 2026)" {
+		t.Errorf("title = %q", state.Title)
+	}
+	if state.Pending != "" || state.Sent != 0 {
+		t.Errorf("legacy file produced a pending delivery: %+v", state)
+	}
+}
+
+func TestStateRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	want := deliveryState{Title: "Старе", Pending: "Нове", Digest: contentDigest("body"), Sent: 3}
+
+	if err := saveState(dir+"/ua", want); err != nil {
+		t.Fatalf("saveState: %v", err)
+	}
+	got, err := readState(dir + "/ua")
+	if err != nil {
+		t.Fatalf("readState: %v", err)
+	}
+	if got != want {
+		t.Errorf("state = %+v, want %+v", got, want)
+	}
+}
+
+func TestReadStateReportsCorruption(t *testing.T) {
+	dir := t.TempDir()
+	if err := saveFile(dir+"/ua", `{"title": "unterminated`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readState(dir + "/ua"); err == nil {
+		t.Fatal("expected corrupt state to be reported rather than read as a title")
 	}
 }
 
@@ -362,23 +523,36 @@ func TestSaveFileLeavesNoTemporaryFile(t *testing.T) {
 // and records the text of every message it is asked to deliver.
 type fakeTelegram struct {
 	mu       sync.Mutex
-	received []string
-	failures int
+	received []string // texts Telegram accepted
+	attempts int      // requests made, including the rejected ones
+	fail     func(attempt int, text string) bool
 	response string
 }
 
 func newFakeTelegram(t *testing.T, failures int, response string) (*bot.Bot, *fakeTelegram) {
 	t.Helper()
+	return newFailingTelegram(t, response, func(attempt int, _ string) bool {
+		return attempt < failures
+	})
+}
 
-	f := &fakeTelegram{failures: failures, response: response}
+func newFailingTelegram(t *testing.T, response string, fail func(attempt int, text string) bool) (*bot.Bot, *fakeTelegram) {
+	t.Helper()
+
+	f := &fakeTelegram{fail: fail, response: response}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		text := telegramText(t, r)
+
 		f.mu.Lock()
-		n := len(f.received)
-		f.received = append(f.received, telegramText(t, r))
+		rejected := f.fail(f.attempts, text)
+		f.attempts++
+		if !rejected {
+			f.received = append(f.received, text)
+		}
 		f.mu.Unlock()
 
 		w.Header().Set("Content-Type", "application/json")
-		if n < f.failures {
+		if rejected {
 			fmt.Fprint(w, f.response)
 			return
 		}
@@ -426,6 +600,12 @@ func (f *fakeTelegram) texts() []string {
 	return append([]string(nil), f.received...)
 }
 
+func (f *fakeTelegram) attemptCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.attempts
+}
+
 const serverError = `{"ok":false,"error_code":500,"description":"Internal Server Error"}`
 
 // Retrying inside the pass keeps a hiccup on one part from forcing the whole
@@ -436,8 +616,11 @@ func TestSendMessageRetriesTransientFailures(t *testing.T) {
 	if err := sendMessage(b, 1, "hello"); err != nil {
 		t.Fatalf("sendMessage: %v", err)
 	}
-	if got := len(tg.texts()); got != SEND_ATTEMPTS {
+	if got := tg.attemptCount(); got != SEND_ATTEMPTS {
 		t.Errorf("made %d attempts, want %d", got, SEND_ATTEMPTS)
+	}
+	if got := len(tg.texts()); got != 1 {
+		t.Errorf("delivered %d messages, want exactly 1", got)
 	}
 }
 
@@ -448,8 +631,11 @@ func TestSendMessageRetriesAfterTooManyRequests(t *testing.T) {
 	if err := sendMessage(b, 1, "hello"); err != nil {
 		t.Fatalf("sendMessage: %v", err)
 	}
-	if got := len(tg.texts()); got != 2 {
+	if got := tg.attemptCount(); got != 2 {
 		t.Errorf("made %d attempts, want 2", got)
+	}
+	if got := len(tg.texts()); got != 1 {
+		t.Errorf("delivered %d messages, want exactly 1", got)
 	}
 }
 
@@ -460,8 +646,11 @@ func TestSendMessageGivesUpAndReportsTheError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected an error after every attempt failed")
 	}
-	if got := len(tg.texts()); got != SEND_ATTEMPTS {
+	if got := tg.attemptCount(); got != SEND_ATTEMPTS {
 		t.Errorf("made %d attempts, want exactly %d", got, SEND_ATTEMPTS)
+	}
+	if got := len(tg.texts()); got != 0 {
+		t.Errorf("delivered %d messages, want none", got)
 	}
 }
 
@@ -615,6 +804,239 @@ func TestGetLastAlertErrorsWhenNothingMatches(t *testing.T) {
 	if _, err := getLastAlert(url); err == nil {
 		t.Fatal("expected an error when the page has no alerts")
 	}
+}
+
+// The whole pipeline on a realistic multi-part alert: the real scraper against
+// a fake embassy site, the real sendMessage against a fake Telegram API, an
+// outage part way through the delivery, and a resume that repeats nothing.
+func TestMultiPartAlertIsDeliveredExactlyOnceAcrossPasses(t *testing.T) {
+	userAgent = DEFAULT_USER_AGENT
+
+	title := "Security Alert – U.S. Embassy Kyiv, Ukraine (August 6, 2026)"
+	paragraph := strings.Repeat("Громадянам США рекомендується зберігати пильність та стежити за повідомленнями місцевої влади. ", 6)
+
+	var body strings.Builder
+	for i := 1; i <= 20; i++ {
+		fmt.Fprintf(&body, "<p>%d. %s</p>", i, paragraph)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		if r.URL.Path == "/category/alert/" {
+			fmt.Fprintf(w, `<html><body><main><article><h2 class="entry-title">`+
+				`<a href="/alert/1">%s</a></h2></article></main></body></html>`, title)
+			return
+		}
+		fmt.Fprintf(w, `<html><body><div class="paragraph alignwide container">`+
+			`<div class="row">%s</div></div></body></html>`, body.String())
+	}))
+	t.Cleanup(srv.Close)
+
+	oldDir, oldAlert, oldContent := titlesDir, fetchAlert, fetchContent
+	t.Cleanup(func() { titlesDir, fetchAlert, fetchContent = oldDir, oldAlert, oldContent })
+	titlesDir = t.TempDir()
+	fetchAlert = func(string) (Alert, error) {
+		alert, err := getLastAlert(srv.URL + "/category/alert/")
+		alert.URL = srv.URL + alert.URL // the fake site serves a relative href
+		return alert, err
+	}
+	fetchContent = getHtmlContent
+
+	// A file in the pre-upgrade bare-title format, holding an older alert.
+	if err := saveFile(titlesDir+"/ua", "An older alert"); err != nil {
+		t.Fatal(err)
+	}
+
+	content, err := getHtmlContent(srv.URL + "/alert/1")
+	if err != nil {
+		t.Fatalf("getHtmlContent: %v", err)
+	}
+	if !strings.Contains(content, title) {
+		content = title + "\n\n" + content
+	}
+	wantParts := split(content, MAX_MESSAGE_LENGTH)
+	if len(wantParts) < 3 {
+		t.Fatalf("this test needs a multi-part alert, got %d part(s) from %d units",
+			len(wantParts), utf16Len(content))
+	}
+
+	var failing atomic.Value
+	failing.Store("")
+	b, tg := newFailingTelegram(t, serverError, func(_ int, text string) bool {
+		return text == failing.Load().(string)
+	})
+	send := func(chatID int64, text string) error { return sendMessage(b, chatID, text) }
+
+	// Pass 1: Telegram rejects the second part on every attempt.
+	failing.Store(wantParts[1])
+	if err := checkCountry(send, "ua", 1); err == nil {
+		t.Fatal("expected the interrupted pass to report an error")
+	}
+	if got := len(tg.texts()); got != 1 {
+		t.Fatalf("interrupted pass delivered %d parts, want 1", got)
+	}
+	if state := mustReadState(t, titlesDir+"/ua"); state.Title != "An older alert" || state.Sent != 1 {
+		t.Fatalf("checkpoint = %+v, want the older title with 1 part sent", state)
+	}
+
+	// Pass 2: the outage is over and delivery resumes.
+	failing.Store("")
+	if err := checkCountry(send, "ua", 1); err != nil {
+		t.Fatalf("resumed pass: %v", err)
+	}
+
+	delivered := tg.texts()
+	if len(delivered) != len(wantParts) {
+		t.Fatalf("delivered %d messages in total, want %d", len(delivered), len(wantParts))
+	}
+	for i, want := range wantParts {
+		if delivered[i] != want {
+			t.Errorf("message %d differs from the expected split", i)
+		}
+		if n := utf16Len(want); n > MAX_MESSAGE_LENGTH {
+			t.Errorf("part %d is %d UTF-16 units, Telegram allows %d", i, n, MAX_MESSAGE_LENGTH)
+		}
+	}
+	if tg.attemptCount() <= len(wantParts) {
+		t.Errorf("made %d attempts, expected retries of the rejected part", tg.attemptCount())
+	}
+
+	state := mustReadState(t, titlesDir+"/ua")
+	if state.Title != title || state.Pending != "" || state.Sent != 0 {
+		t.Errorf("final state = %+v, want %q committed with nothing pending", state, title)
+	}
+
+	t.Logf("%d parts, %d units, %d Telegram calls", len(wantParts), utf16Len(content), tg.attemptCount())
+}
+
+// Embassies reuse headlines. "Security Alert: U.S. Embassy Kyiv, Ukraine"
+// covered two unrelated alerts a month apart; comparing titles alone dropped
+// the second one entirely and silently.
+func TestSameTitleAtADifferentURLIsStillDelivered(t *testing.T) {
+	s := newStub(t)
+	s.alert = Alert{Title: "Security Alert: U.S. Embassy Kyiv, Ukraine", URL: "https://ua.usembassy.gov/may-9-2025/"}
+	s.content = "A potentially significant air attack may occur."
+
+	// Bootstrap records the first alert without sending it.
+	if err := checkCountry(s.send, "ua", 1); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+
+	// A different article published later under the identical headline.
+	s.alert.URL = "https://ua.usembassy.gov/june-6-2025/"
+	s.content = "A significant missile and drone attack struck sites across Ukraine."
+	if err := checkCountry(s.send, "ua", 1); err != nil {
+		t.Fatalf("second alert: %v", err)
+	}
+	if len(s.sent) != 1 {
+		t.Fatalf("delivered %d messages for the second alert, want 1", len(s.sent))
+	}
+	if !strings.Contains(s.sent[0], "missile and drone") {
+		t.Errorf("delivered the wrong alert: %.60q", s.sent[0])
+	}
+
+	// The very same article must still not be re-sent.
+	s.sent = nil
+	if err := checkCountry(s.send, "ua", 1); err != nil {
+		t.Fatalf("third pass: %v", err)
+	}
+	if len(s.sent) != 0 {
+		t.Errorf("re-sent %d messages for an unchanged alert", len(s.sent))
+	}
+}
+
+// Upgrading from a bare-title file leaves no URL to compare, and the current
+// alert must not be re-broadcast because of that.
+func TestLegacyStateWithoutURLDoesNotResend(t *testing.T) {
+	s := newStub(t)
+	s.setTitle(t, "ru", "Security Alert – U.S. Embassy Moscow, Russia (June 18, 2026)")
+	s.alert = Alert{
+		Title: "Security Alert – U.S. Embassy Moscow, Russia (June 18, 2026)",
+		URL:   "https://ru.usembassy.gov/security-alert-june-18-2026/",
+	}
+	s.content = "body"
+
+	if err := checkCountry(s.send, "ru", 1); err != nil {
+		t.Fatalf("checkCountry: %v", err)
+	}
+	if len(s.sent) != 0 {
+		t.Fatalf("re-sent %d messages after the upgrade, want none", len(s.sent))
+	}
+}
+
+// A title carrying invalid UTF-8 used to be mangled by json.Marshal, so the
+// stored value never matched the scraped one and the alert was re-broadcast
+// every single hour.
+func TestInvalidUTF8InTitleDoesNotLoopForever(t *testing.T) {
+	s := newStub(t)
+	s.alert = Alert{
+		Title: "Security Alert \x96 U.S. Embassy Ankara", // Windows-1252 en dash
+		URL:   "https://tr.usembassy.gov/alert/",
+	}
+	s.content = "body of the alert"
+
+	if err := checkCountry(s.send, "tr", 1); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	for pass := 2; pass <= 4; pass++ {
+		if err := checkCountry(s.send, "tr", 1); err != nil {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+	}
+	if len(s.sent) != 0 {
+		t.Fatalf("re-delivered the same alert %d times across three passes", len(s.sent))
+	}
+	if !utf8.ValidString(s.state(t, "tr").Title) {
+		t.Error("stored title is not valid UTF-8")
+	}
+}
+
+func TestInvalidUTF8InContentIsSanitised(t *testing.T) {
+	s := newStub(t)
+	s.setTitle(t, "il", "Old alert")
+	s.alert = Alert{Title: "New alert", URL: "https://il.usembassy.gov/new/"}
+	s.content = "New alert\n\nbody with a bad byte \xff here"
+
+	if err := checkCountry(s.send, "il", 1); err != nil {
+		t.Fatalf("checkCountry: %v", err)
+	}
+	if len(s.sent) != 1 {
+		t.Fatalf("delivered %d messages, want 1", len(s.sent))
+	}
+	if !utf8.ValidString(s.sent[0]) {
+		t.Error("delivered a message that Telegram would reject as invalid UTF-8")
+	}
+}
+
+// A hand-edited or corrupted offset must not index outside the parts slice.
+func TestDeliverIgnoresAnOutOfRangeOffset(t *testing.T) {
+	content := "New alert\n\nbody"
+	alert := Alert{Title: "New alert", URL: "https://x/new/"}
+
+	for _, sent := range []int{-1, 99} {
+		s := newStub(t)
+		state := deliveryState{
+			Title:   "Old alert",
+			Pending: alert.Title,
+			Digest:  contentDigest(content),
+			Sent:    sent,
+		}
+		if err := deliver(s.send, 1, s.dir+"/ua", state, alert, content); err != nil {
+			t.Fatalf("sent=%d: %v", sent, err)
+		}
+		if len(s.sent) != 1 {
+			t.Errorf("sent=%d: delivered %d messages, want the alert delivered once", sent, len(s.sent))
+		}
+	}
+}
+
+func mustReadState(t *testing.T, fileName string) deliveryState {
+	t.Helper()
+	state, err := readState(fileName)
+	if err != nil {
+		t.Fatalf("readState: %v", err)
+	}
+	return state
 }
 
 // A missing titles file is the bootstrap signal, not an error.

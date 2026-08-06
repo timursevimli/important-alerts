@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -84,26 +87,35 @@ func checkCountry(send sendFunc, country string, chatID int64) error {
 	fileName := titlesDir + "/" + country
 	log.Print("Checking: " + baseURL)
 
-	lastTitle, err := readFile(fileName)
+	state, err := readState(fileName)
 	if err != nil {
-		return fmt.Errorf("read last title: %w", err)
+		return fmt.Errorf("read state: %w", err)
 	}
-	log.Print("Last alert: " + lastTitle)
+	log.Print("Last alert: " + state.Title)
 
 	alert, err := fetchAlert(baseURL + "/category/alert/")
 	if err != nil {
 		return fmt.Errorf("fetch alert list: %w", err)
 	}
+	// The title is stored and compared as JSON, which cannot carry invalid
+	// UTF-8. Normalising it here keeps the stored and the compared value
+	// identical, otherwise the alert would look new on every pass forever.
+	alert.Title = strings.ToValidUTF8(alert.Title, "")
+	alert.URL = strings.ToValidUTF8(alert.URL, "")
 
-	if lastTitle == "" {
-		if err := saveFile(fileName, alert.Title); err != nil {
+	if state.Title == "" && state.Pending == "" {
+		if err := saveState(fileName, deliveryState{Title: alert.Title, URL: alert.URL}); err != nil {
 			return fmt.Errorf("save initial title: %w", err)
 		}
 		log.Print("Initial alert created: " + baseURL)
 		return nil
 	}
 
-	if alert.Title == lastTitle {
+	// Embassies reuse headlines: "Security Alert: U.S. Embassy Kyiv, Ukraine"
+	// has covered several unrelated alerts. Comparing the permalink as well
+	// keeps the second one from being silently swallowed. State written before
+	// the URL was recorded has none, so fall back to the title alone there.
+	if alert.Title == state.Title && (state.URL == "" || alert.URL == state.URL) {
 		log.Print("No new alerts: " + baseURL)
 		return nil
 	}
@@ -113,6 +125,9 @@ func checkCountry(send sendFunc, country string, chatID int64) error {
 	if err != nil {
 		return fmt.Errorf("fetch alert content: %w", err)
 	}
+	// Telegram rejects invalid UTF-8, which would make this alert fail to send
+	// on every pass forever.
+	content = strings.ToValidUTF8(content, "")
 	if content == "" {
 		return errors.New("no content: " + alert.URL)
 	}
@@ -120,14 +135,103 @@ func checkCountry(send sendFunc, country string, chatID int64) error {
 		content = alert.Title + "\n\n" + content
 	}
 
-	// The title is recorded only once every part has reached Telegram, so a
-	// failed send is retried on the next pass instead of being lost. The cost
-	// is at-least-once delivery: a failure part way through a multi-part alert
-	// re-sends the parts that already arrived.
-	if err := sendAlert(send, chatID, content); err != nil {
+	if err := deliver(send, chatID, fileName, state, alert, content); err != nil {
 		return fmt.Errorf("send alert: %w", err)
 	}
-	return saveFile(fileName, alert.Title)
+	return nil
+}
+
+// deliveryState is what a titles/<country> file holds. Title and URL identify
+// the alert that has been delivered in full; Pending, Digest and Sent track an
+// alert whose delivery was interrupted part way through.
+type deliveryState struct {
+	Title   string `json:"title"`
+	URL     string `json:"url,omitempty"`
+	Pending string `json:"pending,omitempty"`
+	Digest  string `json:"digest,omitempty"`
+	Sent    int    `json:"sent,omitempty"`
+}
+
+// deliver sends only the parts that have not arrived yet and checkpoints after
+// each one, so an interrupted alert resumes where it stopped instead of
+// repeating the parts a subscriber has already read.
+//
+// Delivery is exactly-once up to the durability of the checkpoint. Two windows
+// remain at-least-once, and both repeat only the parts sent since the last
+// checkpoint that reached disk: a crash between a successful send and its
+// checkpoint, and a checkpoint write that itself fails after the send
+// succeeded.
+func deliver(send sendFunc, chatID int64, fileName string, state deliveryState, alert Alert, content string) error {
+	parts := split(content, MAX_MESSAGE_LENGTH)
+	if len(parts) == 0 {
+		return errors.New("nothing to send")
+	}
+	digest := contentDigest(content)
+
+	// Resume only if the pending alert really is this one and its text has not
+	// changed underneath us, otherwise the stored offset would skip the wrong
+	// piece of a rewritten page. A hand-edited offset must not index outside
+	// the slice.
+	sent := 0
+	if state.Pending == alert.Title && state.Digest == digest && state.Sent >= 0 && state.Sent <= len(parts) {
+		sent = state.Sent
+	}
+	if sent > 0 {
+		log.Printf("resuming delivery at part %d of %d", sent+1, len(parts))
+	}
+
+	for i := sent; i < len(parts); i++ {
+		if err := send(chatID, parts[i]); err != nil {
+			return err
+		}
+		checkpoint := deliveryState{
+			Title:   state.Title,
+			URL:     state.URL,
+			Pending: alert.Title,
+			Digest:  digest,
+			Sent:    i + 1,
+		}
+		if err := saveState(fileName, checkpoint); err != nil {
+			return fmt.Errorf("checkpoint after part %d of %d: %w", i+1, len(parts), err)
+		}
+	}
+
+	// Every part has arrived, so this becomes the last fully delivered alert.
+	return saveState(fileName, deliveryState{Title: alert.Title, URL: alert.URL})
+}
+
+func contentDigest(content string) string {
+	sum := sha256.Sum256([]byte(content))
+	return hex.EncodeToString(sum[:])
+}
+
+// readState accepts both the JSON written by saveState and the bare title that
+// older versions stored, so an upgrade does not re-send the current alert.
+func readState(fileName string) (deliveryState, error) {
+	raw, err := readFile(fileName)
+	if err != nil {
+		return deliveryState{}, err
+	}
+	if raw == "" {
+		return deliveryState{}, nil
+	}
+	if !strings.HasPrefix(raw, "{") {
+		return deliveryState{Title: raw}, nil
+	}
+
+	var state deliveryState
+	if err := json.Unmarshal([]byte(raw), &state); err != nil {
+		return deliveryState{}, fmt.Errorf("corrupt state in %s: %w", fileName, err)
+	}
+	return state, nil
+}
+
+func saveState(fileName string, state deliveryState) error {
+	encoded, err := json.Marshal(state)
+	if err != nil {
+		return err
+	}
+	return saveFile(fileName, string(encoded))
 }
 
 func loadEnv() {
@@ -197,7 +301,12 @@ func utf16Len(s string) int {
 // that fits. The returned index is always on a rune boundary and greater than
 // zero, so callers always make progress.
 func cutIndex(s string, limit int) int {
-	units, hardEnd := 0, len(s)
+	// minFill is the byte index at which the piece reaches half the unit
+	// budget. Measuring it in units rather than bytes matters for Cyrillic and
+	// Hebrew, where a byte-based halfway point sits far later in the text.
+	units, hardEnd, minFill := 0, len(s), -1
+	half := limit / 2
+
 	for i, r := range s {
 		width := 1
 		if r > 0xFFFF {
@@ -208,6 +317,9 @@ func cutIndex(s string, limit int) int {
 			break
 		}
 		units += width
+		if minFill < 0 && units >= half {
+			minFill = i
+		}
 	}
 	if hardEnd == 0 {
 		// limit is smaller than the first rune; emit that rune alone rather
@@ -215,10 +327,12 @@ func cutIndex(s string, limit int) int {
 		_, size := utf8.DecodeRuneInString(s)
 		return size
 	}
+	if minFill < 0 {
+		minFill = hardEnd
+	}
 
 	// Only accept a separator that leaves the piece at least half full,
 	// otherwise a stray early newline would produce a flood of tiny messages.
-	minFill := hardEnd / 2
 	for _, sep := range []string{"\n\n", "\n", " "} {
 		if i := strings.LastIndex(s[:hardEnd], sep); i >= minFill {
 			return i + len(sep)
@@ -230,7 +344,14 @@ func cutIndex(s string, limit int) int {
 // split breaks content into pieces that each fit within limit UTF-16 code
 // units, cutting on paragraph, line or word boundaries and never in the middle
 // of a rune.
+//
+// A limit below two is raised to two: an astral rune such as an emoji costs
+// two units and cannot be broken, so no smaller piece exists.
 func split(content string, limit int) []string {
+	if limit < 2 {
+		limit = 2
+	}
+
 	var parts []string
 	for {
 		content = strings.TrimLeft(content, " \t\n\r")
@@ -255,15 +376,6 @@ func getBot() *bot.Bot {
 		log.Fatalf("cannot create bot: %v", err)
 	}
 	return b
-}
-
-func sendAlert(send sendFunc, chatID int64, content string) error {
-	for _, part := range split(content, MAX_MESSAGE_LENGTH) {
-		if err := send(chatID, part); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // sendMessage retries within the pass so that a transient failure does not
