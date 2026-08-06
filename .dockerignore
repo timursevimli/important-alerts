@@ -1,0 +1,15 @@
+# Secrets and history must never reach the image — the final stage does
+# `COPY . .`, so anything not listed here ships to production.
+.env
+.git
+.gitignore
+
+# Not needed at build or run time
+README.md
+LICENSE
+docker-compose.yml
+Dockerfile
+*_test.go
+
+# Local build artifact
+/important-notifications
