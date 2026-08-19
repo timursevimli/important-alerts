@@ -23,3 +23,6 @@
 # Go workspace file
 go.work
 .env
+
+# Delivery state, written at runtime — must never be clobbered by a pull
+/titles/
